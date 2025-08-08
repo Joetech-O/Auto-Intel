@@ -1,4 +1,7 @@
 streamlit
-matplotlib
 pandas
-numpy
+matplotlib
+seaborn
+wordcloud
+sqlalchemy
+altair
