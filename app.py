@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -5,145 +6,491 @@ import seaborn as sns
 from wordcloud import WordCloud
 from sqlalchemy import create_engine
 from collections import Counter
-import ast
 import altair as alt
 from urllib.parse import urlparse
+import nltk
+from nltk.corpus import stopwords
 
-# Database connection
-engine = create_engine('postgresql://auto_intel:auto-intel@localhost/auto-intel')
+# === Deterministic DB diagnostics (no secrets printed) ===
+def _db_diagnostics():
+    import socket, time
+    from sqlalchemy import text as _sqltext
+    st.write("### Database Diagnostics")
+    try:
+        eng = get_engine()
+        # Resolve host and test low-level connectivity
+        url = eng.url.render_as_string(hide_password=True)
+        host = url.split("@", 1)[1].split("/", 1)[0].split(":")[0]
+        st.write(f"- Engine URL (sanitized): `{url}`")
+        try:
+            ip = socket.gethostbyname(host)
+            st.write(f"- DNS: `{host}` → `{ip}` ✅")
+        except Exception as e:
+            st.error(f"- DNS resolution failed for `{host}`: {e}")
+            return
+        # Try SELECT 1 with short timeout
+        with eng.connect() as c:
+            c.execution_options(timeout=10)
+            one = c.execute(_sqltext("SELECT 1")).scalar()
+            st.write(f"- DB round-trip: SELECT 1 → `{one}` ✅")
+            # List public tables
+            tables = pd.read_sql(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY table_name;",
+                c
+            )["table_name"].tolist()
+            st.write(f"- Visible public tables ({len(tables)}): {', '.join(tables) if tables else '(none)'}")
+            if "car_news" not in tables:
+                st.warning("Table `car_news` is not present. Update your query or create the table.")
+    except Exception as e:
+        st.error(f"Connection check failed: {e}")
 
-# Cached data loaders
+if st.sidebar.button("Run DB diagnostics"):
+    _db_diagnostics()
+    st.stop()
+
+from db_utils import get_engine
+
+# NLTK setup
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
+
+# DB
+#engine = get_engine()
+# DB_URL moved to st.secrets
+engine = get_engine()
+
+# LOADERS
 @st.cache_data
 def load_data():
-    df = pd.read_sql("SELECT * FROM newcar_reviews;", engine)
-    df['publication_date'] = pd.to_datetime(df['publication_date'], utc=True)
+    """Car News"""
+    df = pd.read_sql("SELECT * FROM car_news;", engine)
+    if 'publication_date' in df.columns:
+        df['publication_date'] = pd.to_datetime(df['publication_date'], utc=True)
     return df
 
-
+@st.cache_data
+def load_car_data():
+    """Car Reviews"""
+    df1 = pd.read_sql("SELECT * FROM car_review;", engine)
+    if 'publication_date' in df1.columns:
+        df1['publication_date'] = pd.to_datetime(df1['publication_date'], utc=True)
+    return df1
 
 @st.cache_data
 def load_keyword_data():
-    keywords=pd.read_sql("SELECT * FROM keyword_pairs;", engine)
-    return keywords
+    return pd.read_sql("SELECT * FROM keyword_pairs;", engine)
 
-# Cached loader with keyword sanitation
 @st.cache_data
 def load_topic_data():
     df = pd.read_sql("SELECT * FROM news_articles_topics;", engine)
 
-    # Sanitize the topic_keywords column
+    # sanitize topic_keywords (string of comma-separated tokens expected)
     def sanitize_keywords(val):
         if not isinstance(val, str):
             return ""
-        # Split, strip spaces, lowercase, and remove empty tokens
-        keywords = [kw.strip().lower() for kw in val.split(',') if kw.strip()]
-        return ', '.join(keywords)
+        keywords = [kw.strip().lower() for kw in val.split(",") if kw.strip()]
+        return ", ".join(keywords)
 
-    df['topic_keywords'] = df['topic_keywords'].apply(sanitize_keywords)
+    if 'topic_keywords' in df.columns:
+        df['topic_keywords'] = df['topic_keywords'].apply(sanitize_keywords)
     return df
 
+@st.cache_data
+def load_ner_news():
+    # adjust this table name to your actual news NER table if different
+    return pd.read_sql("SELECT * FROM car_news_named_entities;", engine)
 
 @st.cache_data
-def load_ner_data():
-    return pd.read_sql("SELECT * FROM car_review_named_entities;", engine)
+def load_ner_reviews():
+    # your snippet had two review NER tables; use the one that exists
+    try:
+        return pd.read_sql("SELECT * FROM car_reviews_named_entities;", engine)
+    except Exception:
+        return pd.read_sql("SELECT * FROM car_review_named_entities;", engine)
 
-# Load datasets
-df = load_data()
-topic_df = load_topic_data()
-ner_df = load_ner_data()
-keywords=load_keyword_data()
+@st.cache_data
+def load_market_trend():
+    return pd.read_sql("SELECT * FROM market_trend_monthly;", engine)
 
-# Sidebar UI
+@st.cache_data
+def load_sentiment_trend():
+    return pd.read_sql("SELECT * FROM sentiment_trend_monthly;", engine)
+
+# -------------------------------------------------------------------
+# DATA
+# -------------------------------------------------------------------
+news_df   = load_data()
+reviews_df = load_car_data()
+try:
+    topic_df  = load_topic_data()
+except Exception as _e:
+    st.error("Failed to load from the database. Use **Run DB diagnostics** in the sidebar to see why.")
+    st.stop()
+keywords  = load_keyword_data()
+ner_news = load_ner_news()
+ner_reviews = load_ner_reviews()
+
+
+# helper: pick available text columns for searching
+def pick_text_cols(df: pd.DataFrame):
+    candidates = ["content", "verdict", "cleaned_content", "article_text", "body", "description"]
+    return [c for c in candidates if c in df.columns]
+
+# -------------------------------------------------------------------
+# UI
+# -------------------------------------------------------------------
 st.sidebar.title("Auto-Intel Dashboard")
-option = st.sidebar.radio("Choose Analysis:", (
-    "Sentiment Trends", "Source Analysis", "Top Keywords", "Word Cloud", "Topic Modeling", "Named Entities", "Sentiment Timeline"
-))
-st.title("Auto-Intel News Analysis Dashboard")
-# 1. Sentiment Trends
-if option == "Sentiment Trends":
+
+section = st.sidebar.selectbox("Choose Dataset:", ["Car News", "Car Reviews"], index=0)
+
+if section == "Car News":
+    news_option = st.sidebar.radio(
+        "Car News • Choose Analysis:",
+        ("Sentiment Trends", "Source Analysis", "Top Keywords", "Word Cloud", "Topic Modeling", "Named Entities"),
+        index=0
+    )
+else:
+    reviews_option = st.sidebar.radio(
+        "Car Reviews • Choose Analysis:",
+        ("Market Trend", "Named Entities", "Source Analysis"),
+        index=0
+    )
+
+# CAR NEWS VIEWS
+
+if section == "Car News" and news_option == "Sentiment Trends":
     st.subheader("Average Sentiment Score Over Time by Sentiment Type")
+    needed = {'publication_date','sentiment_score','sentiment_label'}
+    if needed.issubset(news_df.columns):
+        tmp = news_df.copy()
+        tmp['month'] = pd.to_datetime(tmp['publication_date']).dt.to_period('M').dt.to_timestamp()
+        trend_df = tmp.groupby(['month','sentiment_label'])['sentiment_score'].mean().reset_index()
 
-    df['month'] = pd.to_datetime(df['publication_date']).dt.to_period('M').dt.to_timestamp()
+        chart = alt.Chart(trend_df).mark_line(point=True).encode(
+            x=alt.X('month:T', title='Overtime'),
+            y=alt.Y('sentiment_score:Q', title='Average Sentiment Score', scale=alt.Scale(domain=[-1, 1])),
+            color=alt.Color('sentiment_label:N', title='Sentiment Type',
+                            scale=alt.Scale(domain=["positive","negative","neutral"],
+                                            range=["green","red","gray"])),
+            tooltip=['month:T','sentiment_label:N','sentiment_score:Q']
+        ).properties(title="Average Sentiment Score by Type")
+        st.altair_chart(chart, use_container_width=True)
 
-    trend_df = df.groupby(['month', 'sentiment_label'])['sentiment_score'].mean().reset_index()
+        # --- NEW: Overall average + pie chart ---
+        c1, c2 = st.columns([1,2])
+        with c1:
+            overall_avg = float(news_df['sentiment_score'].mean())
+            st.metric("Overall Avg Sentiment", f"{overall_avg:.3f}")
 
-    chart = alt.Chart(trend_df).mark_line(point=True).encode(
-        x=alt.X('month:T', title='Month'),
-        y=alt.Y('sentiment_score:Q',
-                title='Average Sentiment Score',
-                scale=alt.Scale(domain=[-1, 1])),  # Force Y-axis to range from -1 to 1
-        color=alt.Color('sentiment_label:N', title='Sentiment Type', scale = alt.Scale(
-            domain = ["positive", "negative", "neutral"], 
-            range=["green", "red", "gray"])),
-        tooltip=['month:T', 'sentiment_label:N', 'sentiment_score:Q']
-    ).properties(title="Monthly Average Sentiment Score by Type")
+        with c2:
+            # Distribution pie (counts per label)
+            dist = (news_df['sentiment_label']
+                    .value_counts()
+                    .rename_axis('sentiment_label')
+                    .reset_index(name='count'))
 
-    st.altair_chart(chart, use_container_width=True)
-# if option == "Sentiment Trends":
-#     st.subheader("Average Sentiment Score Over Time by Sentiment Type")
+            pie = alt.Chart(dist).mark_arc().encode(
+                theta=alt.Theta('count:Q'),
+                color=alt.Color('sentiment_label:N', title='Sentiment',
+                                scale=alt.Scale(domain=["positive","negative","neutral"],
+                                                range=["green","red","gray"])),
+                tooltip=['sentiment_label:N','count:Q']
+            ).properties(title="News Sentiment Distribution")
+            st.altair_chart(pie, use_container_width=True)
 
-#     df['month'] = pd.to_datetime(df['publication_date']).dt.to_period('M').dt.to_timestamp()
+    else:
+        st.warning("Required columns not found in car_news (need publication_date, sentiment_score, sentiment_label).")
 
-#     # Group by month and sentiment_label
-#     trend_df = df.groupby(['month', 'sentiment_label'])['sentiment_score'].mean().reset_index()
 
-#     # Build chart
-#     chart = alt.Chart(trend_df).mark_line(point=True).encode(
-#         x=alt.X('month:T', title='Month'),
-#         y=alt.Y('sentiment_score:Q', title='Average Sentiment Score'),
-#         color=alt.Color('sentiment_label:N', title='Sentiment Type'),
-#         tooltip=['month:T', 'sentiment_label:N', 'sentiment_score:Q']
-#     ).properties(title="Monthly Average Sentiment Score by Type")
-
-#     st.altair_chart(chart, use_container_width=True)
-
-# if option == "Sentiment Trends":
-#     st.subheader("Average Sentiment Score Over Time")
-
-#     # Ensure datetime formatting
-#     df['month'] = pd.to_datetime(df['publication_date']).dt.to_period('M').dt.to_timestamp()
-
-#     # Group by month: average sentiment score
-#     avg_trend_df = df.groupby('month')['sentiment_score'].mean().reset_index()
-
-#     # Altair chart
-#     chart = alt.Chart(avg_trend_df).mark_line(point=True).encode(
-#         x=alt.X('month:T', title='Month'),
-#         y=alt.Y('sentiment_score:Q', title='Avg Sentiment Score'),
-#         tooltip=['month:T', 'sentiment_score:Q']
-#     ).properties(title="Monthly Average Sentiment Score")
-
-#     st.altair_chart(chart, use_container_width=True)
-# if option == "Sentiment Trends":
-#     st.subheader("Sentiment Distribution Over Time")
-
-#     df['publication_date'] = pd.to_datetime(df['publication_date'], utc=True)
-#     df['month'] = df['publication_date'].dt.to_period('M').dt.to_timestamp()
-
-#     # Group by month + sentiment
-#     trend_df = df.groupby(['month', 'sentiment_label']).size().unstack(fill_value=0).reset_index()
-#     trend_df = trend_df.set_index('month')
-
-#     st.line_chart(trend_df)
-
-# elif option == "Source Analysis":
-#     st.subheader("Sentiment by News Source")
-#     sentiment_source = df.groupby(['link', 'sentiment_label']).size().unstack(fill_value=0)
-#     st.bar_chart(sentiment_source)
-
-# 2. Source Analysis
-elif option == "Source Analysis":
+# Source Analysis
+elif section == "Car News" and news_option == "Source Analysis":
     st.subheader("Sentiment by News Source")
+    tmp = news_df.copy()
+    # use 'link' if exists; else 'url'
+    link_col = 'link' if 'link' in tmp.columns else ('url' if 'url' in tmp.columns else None)
+    if link_col is None or 'sentiment_label' not in tmp.columns:
+        st.warning("Missing columns for source analysis (need link/url and sentiment_label).")
+    else:
+        tmp['source_domain'] = tmp[link_col].apply(lambda x: urlparse(str(x)).netloc if pd.notnull(x) else "")
+        sentiment_by_source = tmp.groupby(['source_domain','sentiment_label']).size().reset_index(name='count')
+        pivot_df = sentiment_by_source.pivot(index='source_domain', columns='sentiment_label', values='count').fillna(0)
+        # reorder if all three present
+        for col in ["positive","negative","neutral"]:
+            if col not in pivot_df.columns:
+                pivot_df[col] = 0
+        pivot_df = pivot_df[["positive","negative","neutral"]]
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        pivot_df.plot(kind='bar', stacked=False, ax=ax, color=["green","red","gray"])
+        ax.set_xlabel("News Source"); ax.set_ylabel("Article Count"); ax.set_title("Sentiment Distribution by News Source")
+        plt.xticks(rotation=45, ha='right'); plt.tight_layout()
+        st.pyplot(fig)
+
+# Top KeyWords
+
+elif section == "Car News" and news_option == "Top Keywords":
+    st.subheader("Top Keywords Frequency")
+    if 'phrase' in keywords.columns and 'count' in keywords.columns:
+        # Sort by count descending
+        top_keywords = keywords.sort_values(by='count', ascending=False)
+        # Display table
+        st.dataframe(top_keywords)
+        # Plot top 30
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.barplot(data=top_keywords.head(30), x='count', y='phrase', ax=ax)
+        ax.set_title("Top 20 Keyword Phrases")
+        st.pyplot(fig)
+    else:
+        st.warning("Required columns 'phrase' or 'count' not found in keyword data.")
+
+#Word Cloud
+elif section == "Car News" and news_option == "Word Cloud":
+    st.subheader("Word Cloud of Keyword Phrases")
+    if {'phrase','count'}.issubset(keywords.columns):
+        expanded = []
+        for _, row in keywords.iterrows():
+            phrase = str(row['phrase']); count = int(row['count'])
+            expanded.extend([phrase]*count)
+        text = " ".join(expanded)
+        wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
+        fig, ax = plt.subplots(figsize=(10,5))
+        ax.imshow(wordcloud, interpolation='bilinear'); ax.axis('off')
+        st.pyplot(fig)
+    else:
+        st.warning("The 'keyword_pairs' table must contain 'phrase' and 'count'.")
+
+# Topic Modeling
+elif section == "Car News" and news_option == "Topic Modeling":
+    st.subheader("Dominant Topics in News Articles")
+    if 'dominant_topic' in topic_df.columns:
+        topic_counts = topic_df['dominant_topic'].value_counts().sort_index()
+        topic_labels = {
+            0: "Electric Vehicles",
+            1: "Driving Experience",
+            2: "Car Design & Features",
+            3: "Technology & Innovation",
+            4: "Market Trends"
+        }
+        topic_counts.index = topic_counts.index.map(lambda i: topic_labels.get(i, f"Topic {i}"))
+        st.bar_chart(topic_counts)
+
+        st.subheader("Topic Keywords")
+        if 'topic_keywords' in topic_df.columns:
+            for i in sorted(topic_df['dominant_topic'].dropna().unique()):
+                kws = topic_df[topic_df['dominant_topic']==i]['topic_keywords'].iloc[0]
+                label = topic_labels.get(i, f"Topic {i}")
+                st.markdown(f"**{label}**: {kws}")
+    else:
+        st.warning("Missing 'dominant_topic' in topics table.")
+
+# Named Entity
+elif section == "Car News" and news_option == "Named Entities":
+    st.subheader("Top Named Entities in News Articles")
+    if ner_news.empty:
+        st.info("No NER data for news.")
+    else:
+        label_descriptions = {
+            "ORG": "Organizations (e.g., Tesla, Ford, UN)",
+            "GPE": "Geo-Political Entities (countries, cities)",
+            "PRODUCT": "Commercial Products (e.g., Model 3)"
+        }
+        available_labels = ner_news['label'].dropna().unique().tolist()
+        selected_label = st.selectbox("Filter by Entity Type", sorted(available_labels))
+        st.caption(label_descriptions.get(selected_label, ""))
+
+        # optional label-specific excludes; allow V6 under PRODUCT
+        exclude_by_label = {
+            "GPE": {"dc", "n't", "n’t", "f1", "n t", "ai", "gt", "skoda", "v6", "ferrari"},
+            "ORG": {"dc", "n't", "f1", "n t", "n’t", "ai", "gt", "car", "ev", "apple", "digital"},
+            "PRODUCT": set()
+        }
+        ex = exclude_by_label.get(selected_label, set())
+        
+        sub = ner_news[ner_news['label'] == selected_label].copy()
+        sub = sub[~sub['entity'].str.lower().isin(ex)]   # exclude unwanted
+        sub = sub.sort_values('count', ascending=False)
+
+        fig, ax = plt.subplots(figsize=(10,6))
+        sns.barplot(data=sub.head(30), x='count', y='entity', ax=ax)
+        ax.set_title(f"Top Entities of Type: {selected_label}")
+        st.pyplot(fig)
+
+        # Drill-down
+        selected_entity = st.selectbox("Select an Entity to Explore Mentions", sub['entity'].head(30).tolist())
+        st.markdown(f"### Articles mentioning **{selected_entity}**")
+        text_cols = pick_text_cols(news_df)
+        if not text_cols and 'title' not in news_df.columns:
+            st.warning("No searchable text columns in car_news.")
+        else:
+            if text_cols:
+                search_series = news_df[text_cols].astype(str).agg(" ".join, axis=1)
+            else:
+                search_series = news_df['title'].astype(str)
+            title_series = news_df['title'].astype(str) if 'title' in news_df.columns else pd.Series("", index=news_df.index)
+
+            mask = search_series.str.contains(selected_entity, case=False, na=False) | \
+                   title_series.str.contains(selected_entity, case=False, na=False)
+
+            cols = [c for c in ['title','publication_date','sentiment_label','sentiment_score'] if c in news_df.columns]
+            if text_cols: cols.append(text_cols[0])
+            mentions = news_df.loc[mask, cols].copy()
+
+            if mentions.empty:
+                st.info("No articles matched this entity.")
+            else:
+                if 'sentiment_label' in mentions.columns:
+                    st.write("Sentiment distribution:")
+                    st.bar_chart(mentions['sentiment_label'].value_counts())
+                st.write("Sample mentions:")
+                for _, row in mentions.head(5).iterrows():
+                    ttl = row.get('title', '(no title)')
+                    dt  = row.get('publication_date', '')
+                    lab = row.get('sentiment_label', '')
+                    sc  = row.get('sentiment_score', '')
+                    st.markdown(f"**{ttl}** — _{dt}_ • **{lab}** {f'(score: {sc:.2f})' if isinstance(sc, float) else ''}")
+                    if text_cols:
+                        snip = str(row.get(text_cols[0], ""))[:300]
+                        if snip: st.caption(snip + "…")
+                    st.markdown("---")
+
+# -------------------------------------------------------------------
+# CAR REVIEWS VIEWS
+# -------------------------------------------------------------------
+if section == "Car Reviews" and reviews_option == "Market Trend":
+    st.subheader("Car Reviews • Market Trend")
+
+    # Market metrics
+    market_df = load_market_trend()
+    if market_df.empty:
+        st.warning("`market_trend_monthly` is empty. Run the market trend pipeline.")
+    else:
+        market_df['publication_date'] = pd.to_datetime(market_df['publication_date'])
+        market_df = market_df.set_index('publication_date').sort_index()
+        st.line_chart(market_df[['avg_price','avg_rating']])
+
+        st.subheader("Monthly Article Review Count")
+        st.bar_chart(market_df['article_count'])
+
+    # Review sentiment timeline (if available)
+    if {'publication_date','sentiment_score','sentiment_label'}.issubset(reviews_df.columns):
+        tmp = reviews_df.copy()
+        tmp['month'] = tmp['publication_date'].dt.to_period('M').dt.to_timestamp()
+        r_trend = tmp.groupby(['month','sentiment_label'])['sentiment_score'].mean().reset_index()
+    
+        chart = alt.Chart(r_trend).mark_line(point=True).encode(
+            x=alt.X('month:T', title='Overtime'),
+            y=alt.Y('sentiment_score:Q', title='Average Sentiment Score', scale=alt.Scale(domain=[-1,1])),
+            color=alt.Color('sentiment_label:N', title='Sentiment Type',
+                            scale=alt.Scale(domain=["positive","negative","neutral"],
+                                            range=["green","red","gray"])),
+            tooltip=['month:T','sentiment_label:N','sentiment_score:Q']
+        ).properties(title="Average Review Sentiment by Type")
+        st.altair_chart(chart, use_container_width=True)
+    
+        # --- NEW: Pie chart + overall average metric ---
+        c1, c2 = st.columns([1,2])
+        with c1:
+            overall_avg = float(reviews_df['sentiment_score'].mean())
+            st.metric("Overall Avg Sentiment", f"{overall_avg:.3f}")
+    
+        with c2:
+            dist = (reviews_df['sentiment_label']
+                    .value_counts()
+                    .rename_axis('sentiment_label')
+                    .reset_index(name='count'))
+    
+            pie = alt.Chart(dist).mark_arc().encode(
+                theta=alt.Theta(field='count', type='quantitative'),
+                color=alt.Color('sentiment_label:N', title='Sentiment',
+                                scale=alt.Scale(domain=["positive","negative","neutral"],
+                                                range=["green","red","gray"])),
+                tooltip=['sentiment_label:N','count:Q']
+            ).properties(title="Review Sentiment Distribution (Pie)")
+            st.altair_chart(pie, use_container_width=True)
+
+# Named Entities
+
+elif section == "Car Reviews" and reviews_option == "Named Entities":
+    st.subheader("Top Named Entities in Car Reviews")
+    if ner_reviews.empty:
+        st.info("No NER data for reviews.")
+    else:
+        label_descriptions = {
+            "ORG": "Organizations (e.g., Tesla, Ford, UN)",
+            "GPE": "Geo-Political Entities (countries, cities)",
+            "PRODUCT": "Commercial Products (e.g., Model 3)"
+        }
+        available_labels = ner_reviews['label'].dropna().unique().tolist()
+        selected_label = st.selectbox("Filter by Entity Type", sorted(available_labels))
+        st.caption(label_descriptions.get(selected_label, ""))
+
+        exclude_by_label = {
+            "GPE": {"dc", "n't", "f1", "n t", "ai", "gt", "skoda", "v6", "ferrari"},
+            "ORG": {"dc", "n't", "f1", "n t", "ai", "gt", "car", "ev", "apple", "digital"},
+            "PRODUCT": set()
+        }
+        ex = exclude_by_label.get(selected_label, set())
+        
+        sub = ner_news[ner_news['label'] == selected_label].copy()
+        sub = sub[~sub['entity'].str.lower().isin(ex)]   # exclude unwanted
+        sub = sub.sort_values('count', ascending=False)
+
+        fig, ax = plt.subplots(figsize=(10,6))
+        sns.barplot(data=sub.head(30), x='count', y='entity', ax=ax)
+        ax.set_title(f"Top Entities of Type: {selected_label}")
+        st.pyplot(fig)
+
+        selected_entity = st.selectbox("Select an Entity to Explore Mentions", sub['entity'].head(30).tolist())
+        st.markdown(f"### Review Mentions of **{selected_entity}**")
+
+        text_cols = pick_text_cols(reviews_df)
+        if not text_cols and 'title' not in reviews_df.columns:
+            st.warning("No searchable text columns in car_reviews.")
+        else:
+            if text_cols:
+                search_series = reviews_df[text_cols].astype(str).agg(" ".join, axis=1)
+            else:
+                search_series = reviews_df['title'].astype(str)
+            title_series = reviews_df['title'].astype(str) if 'title' in reviews_df.columns else pd.Series("", index=reviews_df.index)
+
+            mask = search_series.str.contains(selected_entity, case=False, na=False) | \
+                   title_series.str.contains(selected_entity, case=False, na=False)
+
+            cols = [c for c in ['title','publication_date','sentiment_label','sentiment_score','rate','price'] if c in reviews_df.columns]
+            if text_cols: cols.append(text_cols[0])
+            mentions = reviews_df.loc[mask, cols].copy()
+
+            if mentions.empty:
+                st.info("No reviews matched this entity.")
+            else:
+                if 'sentiment_label' in mentions.columns:
+                    st.write("Sentiment distribution:")
+                    st.bar_chart(mentions['sentiment_label'].value_counts())
+                st.write("Sample mentions:")
+                for _, row in mentions.head(5).iterrows():
+                    ttl = row.get('title', '(no title)')
+                    dt  = row.get('publication_date', '')
+                    lab = row.get('sentiment_label', '')
+                    sc  = row.get('sentiment_score', '')
+                    st.markdown(f"**{ttl}** — _{dt}_ • **{lab}** {f'(score: {sc:.2f})' if isinstance(sc, float) else ''}")
+                    if text_cols:
+                        snip = str(row.get(text_cols[0], ""))[:300]
+                        if snip: st.caption(snip + "…")
+                    st.markdown("---")
+# Source Analysis
+
+elif section == "Car Reviews" and reviews_option == "Source Analysis":
+    st.subheader("Sentiment by review Source")
 
     # Extract domain names from full links
-    df['source_domain'] = df['link'].apply(lambda x: urlparse(x).netloc)
+    reviews_df['source_domain'] = reviews_df['link'].apply(lambda x: urlparse(x).netloc)
 
     # Group by domain and sentiment
-    sentiment_by_source = df.groupby(['source_domain', 'sentiment_label']).size().reset_index(name='count')
+    sentiment_by_source = reviews_df.groupby(['source_domain', 'sentiment_label']).size().reset_index(name='count')
 
     # Optional: Keep only top 10 sources by total article count
-    #top_sources = sentiment_by_source.groupby('source_domain')['count'].sum().nlargest(10).index
-    #sentiment_by_source = sentiment_by_source[sentiment_by_source['source_domain'].isin(top_sources)]
+    top_sources = sentiment_by_source.groupby('source_domain')['count'].sum().nlargest(10).index
+    sentiment_by_source = sentiment_by_source[sentiment_by_source['source_domain'].isin(top_sources)]
 
     # Pivot for plotting
     pivot_df = sentiment_by_source.pivot(index='source_domain', columns='sentiment_label', values='count').fillna(0)
@@ -161,197 +508,4 @@ elif option == "Source Analysis":
     plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     st.pyplot(fig)
-
-# 3. Top Keywords
-elif option == "Top Keywords":
-    st.subheader("Top Keywords Frequency")
-    if 'phrase' in keywords.columns and 'count' in keywords.columns:
-        # Sort by count descending
-        top_keywords = keywords.sort_values(by='count', ascending=False)
-        # Display table
-        st.dataframe(top_keywords)
-        # Plot top 30
-        fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(data=top_keywords.head(30), x='count', y='phrase', ax=ax)
-        ax.set_title("Top 20 Keyword Phrases")
-        st.pyplot(fig)
-    else:
-        st.warning("Required columns 'phrase' or 'count' not found in keyword data.")
-# 4. Word Cloud
-elif option == "Word Cloud":
-    st.subheader("Word Cloud of Keyword Phrases")
-
-    if 'phrase' in keywords.columns and 'count' in keywords.columns:
-        # Expand each phrase by its count
-        expanded_keywords = []
-        for _, row in keywords.iterrows():
-            phrase = str(row['phrase'])
-            count = int(row['count'])
-            expanded_keywords.extend([phrase] * count)
-
-        # Join to form the text input for word cloud
-        text = ' '.join(expanded_keywords)
-
-        # Generate word cloud
-        wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
-
-        # Display word cloud
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.imshow(wordcloud, interpolation='bilinear')
-        ax.axis('off')
-        st.pyplot(fig)
-    else:
-        st.warning("The 'phrase' or 'count' column is missing in keyword_pairs.")
-
-
-
-
-# 5. Topic Modeling
-elif option == "Topic Modeling":
-    st.subheader("Dominant Topics in News Articles")
-
-    # Map topic numbers to descriptions (edit as needed)
-    topic_labels = {
-        0: "Electric Vehicles",
-        1: "Driving Experience",
-        2: "Car Design & Features",
-        3: "Technology & Innovation",
-        4: "Market Trends"
-    }
-
-    # Count dominant topics and relabel
-    topic_counts = topic_df['dominant_topic'].value_counts().sort_index()
-    topic_counts.index = topic_counts.index.map(topic_labels)
-
-    # Display chart
-    st.bar_chart(topic_counts)
-
-    # Show topic keywords
-    st.subheader("Topic Keywords")
-    for i in sorted(topic_df['dominant_topic'].dropna().unique()):
-        keywords = topic_df[topic_df['dominant_topic'] == i]['topic_keywords'].iloc[0]
-        label = topic_labels.get(i, f"Topic {i}")
-        st.markdown(f"**{label}**: {', '.join(word.strip() for word in keywords.split(','))}")
-
-
-
-# 6. Named Entity Recognition
-elif option == "Named Entities":
-    st.subheader("Top Named Entities in News Articles")
-
-    # Label descriptions
-    label_descriptions = {
-        "ORG": "Organizations (e.g., Tesla, Ford, UN)",
-        "GPE": "Geo-Political Entities (e.g., countries, cities like Germany, Nairobi)",
-        "PRODUCT": "Commercial Products (e.g., Model 3, iPhone)"
-    }
-
-    # Dropdown 1: Choose entity type (ORG, GPE, etc.)
-    available_labels = ner_df['label'].dropna().unique().tolist()
-    selected_label = st.selectbox("Filter by Entity Type", sorted(available_labels))
-
-    # Description under dropdown
-    st.markdown(f"**{selected_label}** → _{label_descriptions.get(selected_label, 'No description available.')}_")
-
-    # Filter by selected label
-    filtered_entities = ner_df[ner_df['label'] == selected_label].sort_values(by='count', ascending=False)
-
-    # Bar chart of top entities
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.barplot(data=filtered_entities.head(30), x="count", y="entity", ax=ax)
-    ax.set_title(f"Top Entities of Type: {selected_label}")
-    st.pyplot(fig)
-
-    # Dropdown 2: Choose specific entity (e.g., Tesla)
-    selected_entity = st.selectbox("Select an Entity to Explore Mentions", filtered_entities['entity'].head(30).tolist())
-
-    # Show articles mentioning this entity
-    st.markdown(f"### 🔍 Articles Mentioning **{selected_entity}**")
-
-    # Filter articles (assuming 'content' column and clean text)
-    mentions_df = df[df['content'].str.contains(selected_entity, case=False, na=False)]
-
-    # Optional: Show sentiment distribution
-    sentiment_count = mentions_df['sentiment_label'].value_counts()
-    st.bar_chart(sentiment_count)
-
-    # Optional: Display sample articles
-    for i, row in mentions_df[['title', 'content']].head(5).iterrows():
-        st.markdown(f"**{row['title']}**")
-        st.markdown(f"> {row['content'][:300]}...")  # show snippet
-        st.markdown("---")
-# elif option == "Named Entities":
-#     st.subheader("Top Named Entities in News Articles")
-
-#     # Label descriptions
-#     label_descriptions = {
-#         "ORG": "Organizations (e.g., Tesla, Ford, UN)",
-#         "GPE": "Geo-Political Entities (e.g., countries, cities like Germany, Nairobi)",
-#         "PRODUCT": "Commercial Products (e.g., Model 3, iPhone)"
-#     }
-
-#     # Entity type dropdown
-#     available_labels = ner_df['label'].dropna().unique().tolist()
-#     selected_label = st.selectbox("Filter by Entity Type", sorted(available_labels))
-
-#     # Show description under dropdown
-#     description = label_descriptions.get(selected_label, "No description available.")
-#     st.markdown(f"**{selected_label}** → _{description}_")
-
-#     # Filter and display
-#     subset = ner_df[ner_df['label'] == selected_label].sort_values(by='count', ascending=False)
-#     st.dataframe(subset)
-
-#     # Plot
-#     fig, ax = plt.subplots(figsize=(10, 6))
-#     sns.barplot(data=subset.head(30), x="count", y="entity", ax=ax)
-#     ax.set_title(f"Top Entities of Type: {selected_label}")
-#     st.pyplot(fig)
-
-# Market Trend
-
-elif option == "Sentiment Timeline":
-    st.subheader("Monthly Sentiment Score Trend")
-
-    # Load sentiment trend data
-    trend_df = pd.read_sql("SELECT * FROM sentiment_trend_monthly", engine)
-    trend_df.set_index('publication_date', inplace=True)
-
-    # Line chart for average sentiment
-    st.line_chart(trend_df['avg_sentiment'])
-
-    # Stacked sentiment counts
-    st.subheader("Monthly Sentiment Distribution")
-    bar_data = trend_df[['positive', 'neutral', 'negative']]
-    st.bar_chart(bar_data)
-
-    st.markdown("---")
-
-    # Market Trend Visualisation
-    st.subheader("Market Trend Analysis")
-
-    market_df = pd.read_sql("SELECT * FROM market_trend_monthly", engine)
-    market_df.set_index('publication_date', inplace=True)
-
-    # Line chart for average price and rating
-    st.line_chart(market_df[['avg_price', 'avg_rating']])
-
-    # Optional: Bar chart for article volume
-    st.subheader("Monthly Article Count")
-    st.bar_chart(market_df['article_count'])
-
-
-# elif option == "Sentiment Timeline":
-#     st.subheader("Monthly Sentiment Score Trend")
-
-#     trend_df = pd.read_sql("SELECT * FROM sentiment_trend_monthly", engine)
-
-#     # Line chart for average sentiment
-#     st.line_chart(trend_df.set_index('publication_date')['avg_sentiment'])
-
-#     # Stacked sentiment counts
-#     st.subheader("Monthly Sentiment Distribution")
-#     bar_data = trend_df.set_index('publication_date')[['positive', 'neutral', 'negative']]
-#     st.bar_chart(bar_data)
-#     plt.xlabel("Months")
 
